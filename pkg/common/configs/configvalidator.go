@@ -51,6 +51,7 @@ const (
 	PreemptionPolicy                         = "preemption.policy"
 	PreemptionDelay                          = "preemption.delay"
 	QuotaPreemptionDelay                     = "quota.preemption.delay"
+	QueueStarvationDelay                     = "queue.starvation.delay"
 
 	// app sort priority values
 	ApplicationSortPriorityEnabled  = "enabled"
@@ -74,6 +75,12 @@ var DefaultQuotaPreemptionDelay time.Duration = 0
 // DefaultPreemptionDelay is 30 seconds, guaranteed resources must be set to trigger preemption
 var DefaultPreemptionDelay = 30 * time.Second
 var DefaultAskBackOffDelay = 30 * time.Second
+
+// DefaultQueueStarvationDelay is the default value for the queue.starvation.delay property.
+// When a child queue has pending demand but the parent's sort has skipped it for longer than
+// this duration, the parent's sort will hoist the starving child to the front of the order.
+// A value of 0 disables the hoisting behaviour on that parent queue. See YUNIKORN-3243.
+var DefaultQueueStarvationDelay = 15 * time.Second
 
 // QueueNameRegExp to validate the name of a queue.
 // A queue can be a username with the dot replaced. Most systems allow a 32 character username.

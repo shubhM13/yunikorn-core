@@ -21,6 +21,7 @@ package tests
 import (
 	"fmt"
 	"testing"
+	"time"
 
 	"gotest.tools/v3/assert"
 
@@ -1843,4 +1844,229 @@ partitions:
 	assert.Equal(t, sparkpiMem, 0,
 		"CONTRAST: Without priority.offset, sparkpi is starved due to fair-share ratio. "+
 			"This proves priority.offset is the specific config change that eliminates starvation.")
+}
+
+// TestStarvationDelayHoistsSkippedSibling is the end-to-end validation of the
+// YUNIKORN-3243 fix. With queue.starvation.delay configured on the parent and
+// the clock artificially advanced past that delay, the starved sibling must be
+// hoisted to the front of the next scheduling cycle and served — and with it
+// the schedulingAttempted flag on its asks must flip to true so the
+// autoscaler signal path (inspectOutstandingRequests) is no longer blind.
+//
+// The clock is advanced via Queue.SetLastSchedulingAttempt rather than with a
+// wall-clock sleep so the test stays fast and deterministic.
+func TestStarvationDelayHoistsSkippedSibling(t *testing.T) {
+	// Same 3600:1 asymmetric-guarantees setup as TestQueueStarvationWithPriorAllocation
+	// but with queue.starvation.delay configured on root.
+	configData := `
+partitions:
+  - name: default
+    queues:
+      - name: root
+        submitacl: "*"
+        properties:
+          queue.starvation.delay: 100ms
+        queues:
+          - name: large
+            resources:
+              guaranteed:
+                memory: 360G
+              max:
+                memory: 400G
+          - name: small
+            resources:
+              guaranteed:
+                memory: 100M
+              max:
+                memory: 100M
+`
+	ms := &mockScheduler{}
+	defer ms.Stop()
+
+	err := ms.Init(configData, false, false)
+	assert.NilError(t, err, "RegisterResourceManager failed")
+
+	err = ms.proxy.UpdateNode(&si.NodeRequest{
+		Nodes: []*si.NodeInfo{
+			{
+				NodeID:     "node-1:1234",
+				Attributes: map[string]string{},
+				SchedulableResource: &si.Resource{
+					Resources: map[string]*si.Quantity{
+						"memory": {Value: 500000000000},
+					},
+				},
+				Action: si.NodeInfo_CREATE,
+			},
+		},
+		RmID: "rm:123",
+	})
+	assert.NilError(t, err, "NodeRequest failed")
+	ms.mockRM.waitForAcceptedNode(t, "node-1:1234", 1000)
+
+	// Seed small with a prior allocation so its DRF ratio (0.1) dominates
+	// large's (0.0), which is what causes the starvation in the first place.
+	err = ms.addApp("prior-app", "root.small", "default")
+	assert.NilError(t, err)
+	ms.mockRM.waitForAcceptedApplication(t, "prior-app", 1000)
+	err = ms.addAppRequest("prior-app", "prior", &si.Resource{
+		Resources: map[string]*si.Quantity{"memory": {Value: 10000000}},
+	}, 1)
+	assert.NilError(t, err)
+
+	smallQueue := ms.getQueue("root.small")
+	largeQueue := ms.getQueue("root.large")
+	waitForPendingQueueResource(t, smallQueue, 10000000, 1000)
+	ms.scheduler.MultiStepSchedule(3)
+	ms.mockRM.waitForAllocations(t, 1, 1000)
+
+	// Add the noisy neighbour on the large queue plus the small sparkpi ask
+	// that would normally be starved indefinitely.
+	err = ms.addApp("large-app", "root.large", "default")
+	assert.NilError(t, err)
+	ms.mockRM.waitForAcceptedApplication(t, "large-app", 1000)
+	err = ms.addAppRequest("large-app", "large", &si.Resource{
+		Resources: map[string]*si.Quantity{"memory": {Value: 1000000000}},
+	}, 20)
+	assert.NilError(t, err)
+
+	err = ms.addApp("sparkpi-app", "root.small", "default")
+	assert.NilError(t, err)
+	ms.mockRM.waitForAcceptedApplication(t, "sparkpi-app", 1000)
+	err = ms.addAppRequest("sparkpi-app", "sparkpi", &si.Resource{
+		Resources: map[string]*si.Quantity{"memory": {Value: 1000000}},
+	}, 1)
+	assert.NilError(t, err)
+
+	waitForPendingQueueResource(t, largeQueue, 20*1000000000, 1000)
+	waitForPendingQueueResource(t, smallQueue, 1000000, 1000)
+
+	// A single quick cycle still starves small: its clock has only just
+	// started (demand arrived moments ago) so it is inside the grace window
+	// and the DRF sort wins normally.
+	ms.scheduler.MultiStepSchedule(1)
+	sparkpiApp := ms.getApplication("sparkpi-app")
+	assert.Equal(t,
+		int(sparkpiApp.GetAllocatedResource().Resources[siCommon.Memory]), 0,
+		"baseline: within the grace window, DRF sort is unchanged and small is still starved")
+	sparkpiAsk := sparkpiApp.GetAllocationAsk("sparkpi-0")
+	assert.Assert(t, sparkpiAsk != nil, "sparkpi ask should exist")
+	assert.Check(t, !sparkpiAsk.IsSchedulingAttempted(),
+		"baseline: schedulingAttempted should still be false inside the grace window")
+
+	// Simulate small being skipped past the starvation delay without waiting
+	// for wall-clock time. The parent's next sortQueues() must hoist small
+	// because its lastSchedulingAttempt is now older than any other sibling's.
+	smallQueue.SetLastSchedulingAttempt(time.Now().Add(-time.Second))
+
+	// A single cycle is enough: the hoist runs inside sortQueues and small is
+	// visited before large.
+	ms.scheduler.MultiStepSchedule(1)
+
+	sparkpiMem := int(sparkpiApp.GetAllocatedResource().Resources[siCommon.Memory])
+	assert.Equal(t, sparkpiMem, 1000000,
+		"FIX CONFIRMED: once small has been skipped past queue.starvation.delay, "+
+			"the parent's sort hoists it to the front and the ask is served on "+
+			"the very next cycle even though its DRF ratio is still dominant.")
+
+	assert.Check(t, sparkpiAsk.IsSchedulingAttempted(),
+		"AUTOSCALER SIGNAL RESTORED: visiting the hoisted queue runs "+
+			"app.tryAllocate() which flips schedulingAttempted to true, so "+
+			"inspectOutstandingRequests will now include this ask.")
+
+	t.Logf("queue.starvation.delay eliminates starvation: sparkpi served after hoist, "+
+		"schedulingAttempted=%v", sparkpiAsk.IsSchedulingAttempted())
+}
+
+// TestStarvationDelayDisabledPreservesDRFBehaviour pins the behavioural
+// contract when the hoisting feature is explicitly turned off on the parent:
+// the scheduler must keep the pre-existing DRF-only sort, reproducing the
+// original starvation bug. This is important so operators who rely on the
+// legacy behaviour can opt out cleanly.
+func TestStarvationDelayDisabledPreservesDRFBehaviour(t *testing.T) {
+	configData := `
+partitions:
+  - name: default
+    queues:
+      - name: root
+        submitacl: "*"
+        properties:
+          queue.starvation.delay: "0s"
+        queues:
+          - name: large
+            resources:
+              guaranteed:
+                memory: 360G
+              max:
+                memory: 400G
+          - name: small
+            resources:
+              guaranteed:
+                memory: 100M
+              max:
+                memory: 100M
+`
+	ms := &mockScheduler{}
+	defer ms.Stop()
+
+	err := ms.Init(configData, false, false)
+	assert.NilError(t, err, "RegisterResourceManager failed")
+
+	err = ms.proxy.UpdateNode(&si.NodeRequest{
+		Nodes: []*si.NodeInfo{
+			{
+				NodeID:     "node-1:1234",
+				Attributes: map[string]string{},
+				SchedulableResource: &si.Resource{
+					Resources: map[string]*si.Quantity{
+						"memory": {Value: 500000000000},
+					},
+				},
+				Action: si.NodeInfo_CREATE,
+			},
+		},
+		RmID: "rm:123",
+	})
+	assert.NilError(t, err, "NodeRequest failed")
+	ms.mockRM.waitForAcceptedNode(t, "node-1:1234", 1000)
+
+	err = ms.addApp("prior-app", "root.small", "default")
+	assert.NilError(t, err)
+	ms.mockRM.waitForAcceptedApplication(t, "prior-app", 1000)
+	err = ms.addAppRequest("prior-app", "prior", &si.Resource{
+		Resources: map[string]*si.Quantity{"memory": {Value: 10000000}},
+	}, 1)
+	assert.NilError(t, err)
+	smallQueue := ms.getQueue("root.small")
+	waitForPendingQueueResource(t, smallQueue, 10000000, 1000)
+	ms.scheduler.MultiStepSchedule(3)
+	ms.mockRM.waitForAllocations(t, 1, 1000)
+
+	err = ms.addApp("large-app", "root.large", "default")
+	assert.NilError(t, err)
+	ms.mockRM.waitForAcceptedApplication(t, "large-app", 1000)
+	err = ms.addAppRequest("large-app", "large", &si.Resource{
+		Resources: map[string]*si.Quantity{"memory": {Value: 1000000000}},
+	}, 20)
+	assert.NilError(t, err)
+	err = ms.addApp("sparkpi-app", "root.small", "default")
+	assert.NilError(t, err)
+	ms.mockRM.waitForAcceptedApplication(t, "sparkpi-app", 1000)
+	err = ms.addAppRequest("sparkpi-app", "sparkpi", &si.Resource{
+		Resources: map[string]*si.Quantity{"memory": {Value: 1000000}},
+	}, 1)
+	assert.NilError(t, err)
+	waitForPendingQueueResource(t, ms.getQueue("root.large"), 20*1000000000, 1000)
+	waitForPendingQueueResource(t, smallQueue, 1000000, 1000)
+
+	// Even after artificially advancing the clock far past any sensible delay,
+	// hoisting must stay disabled because the parent is configured with 0.
+	smallQueue.SetLastSchedulingAttempt(time.Now().Add(-time.Hour))
+	ms.scheduler.MultiStepSchedule(20)
+
+	sparkpiApp := ms.getApplication("sparkpi-app")
+	sparkpiMem := int(sparkpiApp.GetAllocatedResource().Resources[siCommon.Memory])
+	assert.Equal(t, sparkpiMem, 0,
+		"With queue.starvation.delay=0, the legacy DRF-only behaviour must be "+
+			"preserved: small remains starved for the duration of the test.")
 }
